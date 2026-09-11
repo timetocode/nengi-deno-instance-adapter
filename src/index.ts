@@ -1,4 +1,4 @@
-import { User } from 'nengi'
+import { User, UserConnectionState } from 'nengi'
 import type {
     BinaryAdapter,
     BinaryPayload,
@@ -129,16 +129,29 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
 
     upgrade(request: Request, info?: DenoServeHandlerInfo): Response {
         const remoteAddress = info?.remoteAddr?.hostname ?? null
-        const { socket, response } = getDenoRuntime().upgradeWebSocket(request, {
-            idleTimeout: this.idleTimeoutSeconds
-        })
-        const user = new User(socket, this)
+        const user = new User(null, this)
         user.remoteAddress = remoteAddress
+        this.network.onOpen(user)
+        if (user.connectionState === UserConnectionState.Closed) {
+            return new Response('Connection capacity exceeded.', { status: 503 })
+        }
+        let upgraded: ReturnType<DenoRuntime['upgradeWebSocket']>
+        try {
+            upgraded = getDenoRuntime().upgradeWebSocket(request, { idleTimeout: this.idleTimeoutSeconds })
+        } catch (error) {
+            this.network.onClose(user, error)
+            throw error
+        }
+        const { socket, response } = upgraded
+        user.socket = socket
         let closed = false
 
         socket.binaryType = 'arraybuffer'
-        socket.onopen = () => this.network.onOpen(user)
+        socket.onopen = () => {
+            if (user.connectionState === UserConnectionState.Closed) socket.close(1000, 'Connection closed before upgrade completed.')
+        }
         socket.onmessage = event => {
+            if (user.connectionState === UserConnectionState.Closed) return
             if (isBinaryPayload(event.data)) {
                 this.network.onMessage(user, event.data)
                 return
@@ -182,7 +195,7 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
 
     disconnect(user: User, reason: unknown) {
         const socket = user.socket as WebSocket
-        socket.close(1000, closeReason(reason))
+        socket?.close(1000, closeReason(reason))
     }
 
     async close() {

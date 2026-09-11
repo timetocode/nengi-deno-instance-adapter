@@ -38,11 +38,23 @@ async function waitForQueueEvent(instance: Instance, type: NetworkEvent, label: 
 
 const context = new Context()
 context.register(1, defineMessageSchema({ value: Binary.UInt8 }))
-const instance = new Instance(context)
+const instance = new Instance(context, { limits: { maxConnections: 1 } })
 const adapter = new DenoInstanceAdapter(instance.network, { path: '/nengi' })
+if (instance.limits.maxPacketBytes !== 65536) throw new Error('Native smoke resolved a stale core package.')
+const rejectedLimits: string[] = []
+instance.onNetworkLimit = event => rejectedLimits.push(event.limit)
 const client = new Client(context, WebSocketClientAdapter, 20)
 client.setDisconnectHandler(() => {})
 instance.onConnect = async handshake => ({ echoed: handshake.runtime })
+
+{
+    let threw = false
+    try { adapter.upgrade(new Request('http://localhost/nengi')) }
+    catch { threw = true }
+    if (!threw || instance.network.pendingUsers.size !== 0 || instance.queue.length !== 0) {
+        throw new Error('Failed native upgrade retained admission or lifecycle work.')
+    }
+}
 
 {
     let closeCode = 0
@@ -73,6 +85,7 @@ try {
         throw new Error('The native Deno server did not expose its assigned port.')
     }
     const httpResponse = await fetch(`http://127.0.0.1:${port}/nengi`)
+    await httpResponse.text()
     if (httpResponse.status !== 426) {
         throw new Error(`Expected the Deno route to require WebSocket upgrade, got ${httpResponse.status}.`)
     }
@@ -90,6 +103,26 @@ try {
     const connected = await waitForQueueEvent(instance, NetworkEvent.UserConnected, 'Deno connection event')
     if (connected.payload?.echoed !== 'deno-native') {
         throw new Error('Native Deno connection payload was not preserved.')
+    }
+
+    const refusedUpgrade = await fetch(`http://127.0.0.1:${port}/nengi`, { headers: { Upgrade: 'websocket' } })
+    await refusedUpgrade.text()
+    if (refusedUpgrade.status !== 503) throw new Error('Capacity refusal must precede native upgrade.')
+
+    const refusedClient = new Client(context, WebSocketClientAdapter, 20)
+    refusedClient.setDisconnectHandler(() => {})
+    refusedClient.setWebsocketErrorHandler(() => {})
+    let refused = false
+    try {
+        refused = await withTimeout(
+            refusedClient.connect(`ws://127.0.0.1:${port}/nengi`, {}).then(() => false, () => true),
+            'Admission refusal'
+        )
+    } finally {
+        refusedClient.disconnect('refusal cleanup')
+    }
+    if (!refused || !rejectedLimits.includes('maxConnections') || instance.users.size !== 1) {
+        throw new Error('Admission refusal did not preserve the established connection.')
     }
 
     instance.step()
@@ -117,8 +150,8 @@ try {
         throw new Error('Native Deno disconnect did not remove the user.')
     }
 
-    console.log('deno native adapter smoke ok')
 } finally {
     client.disconnect('native smoke cleanup')
-    await adapter.close()
+    await withTimeout(adapter.close(), 'Deno server shutdown')
 }
+console.log('deno native adapter smoke ok')
