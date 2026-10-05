@@ -1,9 +1,9 @@
-import { User, UserConnectionState } from 'nengi'
 import type {
     BinaryAdapter,
     BinaryPayload,
     IServerNetworkAdapter,
-    InstanceNetwork
+    ServerAdapterHost,
+    ServerConnection
 } from 'nengi'
 import { dataViewBinary } from 'nengi-dataviews'
 
@@ -84,15 +84,21 @@ function isBinaryPayload(value: unknown): value is BinaryPayload {
 }
 
 export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload, ArrayBuffer, DenoListenOptions> {
-    readonly network: InstanceNetwork
+    readonly network: ServerAdapterHost
     readonly binary: BinaryAdapter<BinaryPayload, ArrayBuffer>
     server: DenoHttpServer | null = null
 
     private readonly path: string
     private readonly maxBufferedBytes: number
     private readonly idleTimeoutSeconds: number
+    private shutdownPromise?: Promise<void>
 
-    constructor(network: InstanceNetwork, config: DenoInstanceAdapterConfig = {}) {
+    readonly serverAdapterVersion = 1 as const
+
+    constructor(network: ServerAdapterHost, config: DenoInstanceAdapterConfig = {}) {
+        if (network?.serverAdapterVersion !== this.serverAdapterVersion) {
+            throw new Error('This adapter requires nengi server adapter contract version 1. Pass instance.adapterHost from a compatible core.')
+        }
         this.network = network
         this.binary = config.binary ?? dataViewBinary
         this.path = config.path ?? '/'
@@ -105,6 +111,7 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
     }
 
     listen(options: DenoListenOptions, ready?: () => void) {
+        if (this.shutdownPromise) throw new Error('DenoInstanceAdapter has shut down. Create a new adapter to listen again.')
         if (this.server) {
             throw new Error('DenoInstanceAdapter is already listening.')
         }
@@ -129,10 +136,10 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
 
     upgrade(request: Request, info?: DenoServeHandlerInfo): Response {
         const remoteAddress = info?.remoteAddr?.hostname ?? null
-        const user = new User(null, this)
+        const user = this.network.createConnection<WebSocket | null>(null, this, remoteAddress)
         user.remoteAddress = remoteAddress
         this.network.onOpen(user)
-        if (user.connectionState === UserConnectionState.Closed) {
+        if (user.isClosed) {
             return new Response('Connection capacity exceeded.', { status: 503 })
         }
         let upgraded: ReturnType<DenoRuntime['upgradeWebSocket']>
@@ -148,10 +155,10 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
 
         socket.binaryType = 'arraybuffer'
         socket.onopen = () => {
-            if (user.connectionState === UserConnectionState.Closed) socket.close(1000, 'Connection closed before upgrade completed.')
+            if (user.isClosed) socket.close(1000, 'Connection closed before upgrade completed.')
         }
         socket.onmessage = event => {
-            if (user.connectionState === UserConnectionState.Closed) return
+            if (user.isClosed) return
             if (isBinaryPayload(event.data)) {
                 this.network.onMessage(user, event.data)
                 return
@@ -181,7 +188,7 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
         return response
     }
 
-    send(user: User, payload: ArrayBuffer) {
+    send(user: ServerConnection, payload: ArrayBuffer) {
         const socket = user.socket as WebSocket
         if (socket.readyState !== WebSocket.OPEN) {
             throw new Error('Cannot send a nengi snapshot on a closed Deno WebSocket.')
@@ -193,14 +200,32 @@ export class DenoInstanceAdapter implements IServerNetworkAdapter<BinaryPayload,
         socket.send(payload)
     }
 
-    disconnect(user: User, reason: unknown) {
+    disconnect(user: ServerConnection, reason: unknown) {
         const socket = user.socket as WebSocket
         socket?.close(1000, closeReason(reason))
     }
 
-    async close() {
+    shutdown(reason?: any): Promise<void> {
+        if (this.shutdownPromise) return this.shutdownPromise
+        let finish!: () => void
+        let fail!: (error: unknown) => void
+        this.shutdownPromise = new Promise<void>((resolve, reject) => {
+            finish = resolve
+            fail = reject
+        })
         const server = this.server
         this.server = null
-        await server?.shutdown()
+        try {
+            this.network.shutdownAdapter(this, reason)
+            Promise.resolve(server?.shutdown()).then(finish, fail)
+        } catch (error) {
+            fail(error)
+        }
+        return this.shutdownPromise
+    }
+
+    /** @deprecated Use shutdown() for the common server-adapter contract. */
+    close() {
+        return this.shutdown()
     }
 }
